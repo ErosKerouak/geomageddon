@@ -345,165 +345,42 @@ class GeoSiglaStyler:
         return gdf_parts
 
 
-    # --- util: extrair vértices 2D de polígonos (rápido e sem duplicar o último ponto do anel)
-    def _poly_vertices_2d(geom, *, only_exterior: bool = True, stride: int = 1):
-        import numpy as np
-        from shapely.geometry import Polygon, MultiPolygon
-        if geom.is_empty:
-            return np.empty((0, 2))
-        chunks = []
-        def _ring_to_arr(ring):
-            xs, ys = ring.xy
-            arr = np.column_stack([xs, ys])
-            if arr.shape[0] >= 2 and (arr[0] == arr[-1]).all():
-                arr = arr[:-1]       # remove ponto repetido de fechamento
-            return arr[::stride] if stride > 1 else arr
-
-        if isinstance(geom, Polygon):
-            chunks.append(_ring_to_arr(geom.exterior))
-            if not only_exterior:
-                for ring in geom.interiors:
-                    chunks.append(_ring_to_arr(ring))
-        elif isinstance(geom, MultiPolygon):
-            for p in geom.geoms:
-                chunks.append(_ring_to_arr(p.exterior))
-                if not only_exterior:
-                    for ring in p.interiors:
-                        chunks.append(_ring_to_arr(ring))
-        else:
-            try:
-                xs, ys = geom.xy
-                arr = np.column_stack([xs, ys])
-                chunks.append(arr[::stride] if stride > 1 else arr)
-            except Exception:
-                return np.empty((0, 2))
-        return np.vstack(chunks) if chunks else np.empty((0, 2))
-
-
-    # --- util: construir KDTree de vértices dos "grandes"
-    def _build_vertex_kdtree(gA, owner_idx, *, stride: int = 1, only_exterior: bool = True):
-        import numpy as np
-        try:
-            from scipy.spatial import cKDTree
-        except Exception:
-            return None, None, None  # sem SciPy -> chamador usa fallback
-
-        coords_list, owners_list = [], []
-        for idx in owner_idx:
-            V = _poly_vertices_2d(gA.at[idx, "geometry"], only_exterior=only_exterior, stride=stride)
-            if V.size == 0:
-                continue
-            coords_list.append(V)
-            owners_list.append(np.full((V.shape[0],), int(idx), dtype=np.int64))
-
-        if not coords_list:
-            return None, None, None
-
-        P = np.vstack(coords_list)         # Nx2
-        OWN = np.concatenate(owners_list)  # N
-        tree = cKDTree(P)
-        return tree, P, OWN
-
-
-    # --- bloco de "busca de vizinhos" para usar dentro do cull_small_parts_by_scale ---
-    def _assign_targets_with_vertex_kdtree(gA, small_idx, big_idx, big_area, *, k_neighbors: int = 12,
-                                        stride: int = 1, only_exterior: bool = True):
-        """
-        Retorna (to_union: dict[target_idx -> [small...]], to_drop: set[small_idx])
-        usando KDTree nos VÉRTICES dos polígonos grandes.
-        """
-        import numpy as np
-        from shapely import prepared
-
-        to_union, to_drop = {}, set()
-
-        # monta árvore (rápida) com vértices só dos GRANDES
-        tree, P, OWN = _build_vertex_kdtree(gA, big_idx, stride=stride, only_exterior=only_exterior)
-        if tree is None:
-            return to_union, to_drop  # sem SciPy → deixe o chamador usar fallback
-
-        k = int(max(1, min(k_neighbors, len(P))))
-        # cache de geometrias e prepared geoms dos grandes para acelerar intersects
-        big_geom_cache = {int(i): gA.at[int(i), "geometry"] for i in big_idx}
-        big_prep_cache = {i: prepared.prep(geom) for i, geom in big_geom_cache.items()}
-
-        for s_idx in small_idx:
-            s_idx = int(s_idx)
-            s_geom = gA.at[s_idx, "geometry"]
-            # representative_point é mais seguro que centroid (fica dentro)
-            cx, cy = s_geom.representative_point().coords[0]
-            d, j = tree.query([cx, cy], k=k)
-            j = np.atleast_1d(j)
-            cand_ids = np.unique(OWN[j]).tolist()  # IDs absolutos de polígonos candidatos
-
-            # 1) prioriza candidatos que INTERSECTAM/TOCAM; escolhe MAIOR área
-            best_t, best_area, found_touch = None, -1.0, False
-            for t in cand_ids:
-                t = int(t)
-                if t == s_idx:
-                    continue
-                prep = big_prep_cache.get(t)
-                try:
-                    if prep.intersects(s_geom):
-                        found_touch = True
-                        a = float(big_area.get(t, 0.0))
-                        if a > best_area:
-                            best_area, best_t = a, t
-                except Exception:
-                    continue
-
-            # 2) se ninguém toca, usa o MAIS PRÓXIMO (desempate por área)
-            if not found_touch:
-                best_d, best_area = float("inf"), -1.0
-                for t in cand_ids:
-                    t = int(t)
-                    if t == s_idx:
-                        continue
-                    try:
-                        d = s_geom.distance(big_geom_cache[t])
-                    except Exception:
-                        continue
-                    a = float(big_area.get(t, 0.0))
-                    if (d < best_d) or (np.isclose(d, best_d) and a > best_area):
-                        best_d, best_area, best_t = d, a, t
-
-            if best_t is not None:
-                to_union.setdefault(best_t, []).append(s_idx)
-                to_drop.add(s_idx)
-
-        return to_union, to_drop
-
 
 
     def cull_small_parts_by_scale(
         self,
         gdf: Optional[gpd.GeoDataFrame] = None,
         *,
-        min_area_mm2: float = 1.0,   # limiar = 1 mm² no papel
+        min_area_mm2: float = 1.0,  # limiar = 1 mm² na escala da figura atual
         clean_after: bool = True,
-        # tunáveis do caminho rápido (KDTree de vértices)
-        use_kdtree: bool = True,
-        k_neighbors: int = 12,
-        vertex_stride: int = 1,
-        only_exterior: bool = True
+        k_neighbors: int = 8        # nº de vizinhos candidatos por pequeno (KDTree)
     ) -> gpd.GeoDataFrame:
         """
-        Remove partes menores que 'min_area_mm2' (medido no papel, à escala da figura)
-        fundindo-as ao MAIOR polígono vizinho (independente de atributos).
-
-        - A escala N é estimada por width_to_scale(...) usando as configs do __init__.
-        - O limiar metrificado vem de: area_thresh_m2 = (N * 1e-3)^2 * min_area_mm2
-        - Áreas e CRS métrico são obtidos via _area_series(...) (evita reprojeções repetidas).
-        - Seleção de alvo:
-            1) Caminho rápido: KDTree (SciPy) nos VÉRTICES dos polígonos grandes
-            + verificação de intersects/touches (prepared geoms).
-            2) Fallback: STRtree.nearest (Shapely).
-            3) Fallback final: sjoin_nearest (GeoPandas).
+        Versão rápida com cKDTree:
+        - Calcula o limiar de área a partir da escala da figura (width_to_scale).
+        - Usa _area_series para (i) áreas em m² e (ii) CRS métrico (projeta UMA vez).
+        - Para cada polígono "pequeno", consulta k vizinhos "grandes" via KDTree
+            (centros representativos). Prioriza quem intersecta/toca; senão, escolhe
+            o mais próximo; desempate pelo MAIOR alvo.
+        - Faz uma união por alvo (unary_union) e descarta os pequenos.
+        Fallbacks: STRtree.nearest → sjoin → sjoin_nearest.
         """
         import numpy as np
         import pandas as pd
-        import geopandas as gpd
         from shapely.ops import unary_union
+
+        # --- escala atual pela largura da figura ---
+        N = self.width_to_scale(
+            gdf=gdf,
+            fig_width=self.fig_width,
+            width_unit=self.width_unit,
+            dpi=self.dpi,
+            margin=self.margin,
+            margin_unit=self.margin_unit,
+            round_to=self.scale_round_to,
+            round_mode=self.scale_round_mode,
+            return_meta=False,
+        )
 
         # ---------- entrada ----------
         if gdf is None:
@@ -512,161 +389,241 @@ class GeoSiglaStyler:
             raise ValueError("Sem dados. Use combine_and_classify (e clip_to_bbox se quiser) antes.")
         orig_crs = gdf.crs
 
-        # faxina mínima antes de qualquer métrica
         g = gdf.loc[gdf.geometry.notna() & (~gdf.geometry.is_empty)].copy()
         if g.empty:
             return gdf
 
-        # ---------- escala pela largura da figura ----------
-        N = self.width_to_scale(
-            gdf=g,
-            fig_width=self.fig_width,
-            width_unit=self.width_unit,
-            dpi=self.dpi,
-            margin=self.margin,
-            margin_unit=self.margin_unit,
-            round_to=self.scale_round_to,
-            round_mode=self.scale_round_mode,
-            return_meta=False
-        )
+        # ---------- 1) limiar de área (m²) a partir de mm² no papel ----------
+        area_thresh_m2 = (N * 1e-3) ** 2 * float(min_area_mm2)
 
-        # ---------- limiar de área (m²) a partir de mm² no papel ----------
-        # 1 mm no papel = (N * 0.001 m) no terreno → área por mm² = (N*0.001)^2
-        area_thresh_m2 = (float(N) * 1e-3) ** 2 * float(min_area_mm2)
-
-        # ---------- áreas e CRS métrico via _area_series ----------
-        area_s, meta = self._area_series(g, verbose=False)  # Series alinhado a g.index
+        # ---------- 2) áreas e CRS métrico via _area_series ----------
+        area_s, meta = self._area_series(g, verbose=False)
         strat = (meta or {}).get("strategy", "")
         crs_used = (meta or {}).get("crs_used", "")
 
-        # Sem CRS métrico confiável -> não dá pra decidir por área/escala
         if strat.startswith("no_crs") or strat.startswith("fallback"):
             raise ValueError(
-                "Não é possível podar por escala sem um CRS métrico. "
-                "Defina self.area_crs (ex.: Albers/LAEA) ou atribua um CRS projetado ao GeoDataFrame."
+                "Não dá para podar por escala sem CRS métrico. "
+                "Defina self.area_crs (ex.: Albers) ou atribua CRS projetado ao GeoDataFrame."
             )
 
-        # ---------- separar pequenos e grandes ----------
-        small_idx = area_s.index[area_s < area_thresh_m2].to_list()
+        # ---------- 3) separar pequenos e grandes ----------
+        small_idx = area_s.index[area_s < area_thresh_m2]
         if len(small_idx) == 0:
-            # nada a podar
-            return g
+            return g  # nada a fazer
+        big_idx = area_s.index[area_s >= area_thresh_m2]
 
-        big_idx = area_s.index[area_s >= area_thresh_m2].to_list()
+        # projetar UMA vez para o CRS que _area_series usou
+        gA = g.to_crs(crs_used) if (crs_used and (g.crs is None or str(g.crs) != str(crs_used))) else g.copy()
+
         big_area = area_s.loc[big_idx].to_dict()
 
-        # ---------- projetar UMA vez para o CRS métrico que _area_series usou ----------
-        if crs_used and (g.crs is None or str(g.crs) != str(crs_used)):
-            gA = g.to_crs(crs_used)
-        else:
-            gA = g.copy()
-
-        # acumuladores
+        # ---------- 4) KDTree (rápido); fallbacks quando SciPy não estiver presente ----------
         to_union: dict[int, list[int]] = {}
-        to_drop: set[int] = set()
+        to_drop = set()
 
-        # ---------- 1) Caminho rápido: KDTree de vértices dos "grandes" ----------
-        if use_kdtree and len(big_idx) > 0:
-            try:
-                tu, td = _assign_targets_with_vertex_kdtree(
-                    gA,
-                    small_idx,
-                    big_idx,
-                    big_area,
-                    k_neighbors=int(k_neighbors),
-                    stride=int(vertex_stride),
-                    only_exterior=bool(only_exterior),
-                )
-                if tu:
-                    # mescla resultados
-                    for t, lst in tu.items():
-                        to_union.setdefault(int(t), []).extend(int(s) for s in lst)
-                    to_drop.update(int(s) for s in td)
-            except Exception:
-                # se SciPy não estiver disponível ou deu erro, seguimos para fallback
-                pass
-
-        # ---------- 2) Fallback: STRtree.nearest (Shapely) ----------
-        if len(big_idx) > 0:
-            remain = [int(i) for i in small_idx if int(i) not in to_drop]
-            if remain:
+        def _finish_union_drop(gA_local):
+            # executa uniões por alvo e dropa pequenos
+            for tgt, sm_list in to_union.items():
+                if not sm_list:
+                    continue
+                sm_union = unary_union(gA_local.loc[sm_list, "geometry"].tolist())
+                gA_local.at[tgt, "geometry"] = unary_union([gA_local.at[tgt, "geometry"], sm_union])
+            if to_drop:
+                gA_local = gA_local.drop(index=list(to_drop))
+            if clean_after:
                 try:
-                    from shapely.strtree import STRtree
-                    big_geoms = [gA.at[int(i), "geometry"] for i in big_idx]
-                    tree = STRtree(big_geoms)
+                    gA_local["geometry"] = gA_local.geometry.buffer(0)
+                except Exception:
+                    pass
+            g_out = gA_local.to_crs(orig_crs) if orig_crs else gA_local
+            return gpd.GeoDataFrame(g_out, geometry="geometry", crs=orig_crs)
 
-                    # mapeia índice relativo da árvore -> índice absoluto no gA
-                    rel2abs = {rel: int(abs_i) for rel, abs_i in enumerate(big_idx)}
+        # ---- 4A) Tenta SciPy KDTree em centroides/representative_point ----
+        used_fast = False
+        try:
+            from scipy.spatial import cKDTree  # noqa: F401
+            used_fast = True
 
-                    for s_idx in remain:
-                        s_geom = gA.at[int(s_idx), "geometry"]
-                        # pega o vizinho grande mais próximo
-                        rel = tree.nearest(s_geom)
-                        if rel is None:
+            # arrays
+            big_idx_arr = np.asarray(big_idx, dtype=object)
+            small_idx_arr = np.asarray(small_idx, dtype=object)
+            big_geoms = list(gA.loc[big_idx_arr, "geometry"].values)
+            small_geoms = list(gA.loc[small_idx_arr, "geometry"].values)
+
+            # pontos internos (representative_point é robusto p/ polígonos concavos)
+            big_pts = np.array([[geom.representative_point().x, geom.representative_point().y] for geom in big_geoms], dtype="float64")
+            small_pts = np.array([[geom.representative_point().x, geom.representative_point().y] for geom in small_geoms], dtype="float64")
+
+            k = int(max(1, min(k_neighbors, len(big_pts))))
+            tree = cKDTree(big_pts)
+
+            dists, neigh = tree.query(small_pts, k=k, workers=-1)
+            if k == 1:
+                neigh = neigh.reshape(-1, 1)
+
+            # mapa idx -> geom (para evitar pandas no loop)
+            big_geom_by_idx = {int(i): g for i, g in zip(big_idx_arr, big_geoms)}
+
+            # para cada pequeno, examina os k candidatos
+            for row, s_idx in enumerate(small_idx_arr):
+                s_idx = int(s_idx)
+                s_geom = small_geoms[row]
+
+                cand_big_rel = neigh[row]
+                cand_big_abs = big_idx_arr[cand_big_rel]
+
+                # 1) prioriza candidatos que INTERSECTAM/TOCAM; escolhe MAIOR área
+                best_t, best_area, found_touch = None, -1.0, False
+                for t_abs in cand_big_abs:
+                    t_abs = int(t_abs)
+                    if s_idx == t_abs:
+                        continue
+                    try:
+                        if s_geom.intersects(big_geom_by_idx[t_abs]):
+                            found_touch = True
+                            a = float(big_area.get(t_abs, 0.0))
+                            if a > best_area:
+                                best_area, best_t = a, t_abs
+                    except Exception:
+                        continue
+                # 2) se ninguém toca, escolhe o MAIS PRÓXIMO (desempate por área)
+                if not found_touch:
+                    best_t, best_area, best_d = None, -1.0, float("inf")
+                    for t_abs in cand_big_abs:
+                        t_abs = int(t_abs)
+                        if s_idx == t_abs:
                             continue
-                        t_idx = rel2abs.get(int(rel))
-                        if t_idx is None or t_idx == s_idx:
+                        try:
+                            d = s_geom.distance(big_geom_by_idx[t_abs])
+                        except Exception:
+                            continue
+                        a = float(big_area.get(t_abs, 0.0))
+                        if (d < best_d) or (np.isclose(d, best_d) and a > best_area):
+                            best_d, best_area, best_t = d, a, t_abs
+
+                if best_t is not None:
+                    to_union.setdefault(int(best_t), []).append(int(s_idx))
+                    to_drop.add(int(s_idx))
+
+        except Exception:
+            used_fast = False  # sem SciPy? cai para STRtree/sjoin
+
+        # ---- 4B) Fallback STRtree.nearest (você tem!) ----
+        if (not used_fast) and (len(big_idx) > 0):
+            try:
+                from shapely.strtree import STRtree
+                big_idx_arr = np.asarray(big_idx, dtype=object)
+                small_idx_arr = np.asarray(small_idx, dtype=object)
+                big_geoms = list(gA.loc[big_idx_arr, "geometry"].values)
+                small_geoms = list(gA.loc[small_idx_arr, "geometry"].values)
+                tree = STRtree(big_geoms)
+
+                # 1) tenta pares que INTERSECTAM via query (compatível com sua build)
+                try:
+                    q = tree.query(small_geoms, predicate="intersects")
+                except TypeError:
+                    q = None
+
+                if isinstance(q, tuple) and len(q) == 2 and len(q[0]) > 0:
+                    left_i, right_j = q
+                    si_abs = small_idx_arr[np.asarray(left_i)]
+                    bi_abs = big_idx_arr[np.asarray(right_j)]
+                    cand = pd.DataFrame({"src": si_abs, "tgt": bi_abs})
+                    cand["tgt_area"] = cand["tgt"].map(big_area)
+                    best = (cand.sort_values(["src", "tgt_area"], ascending=[True, False])
+                                .drop_duplicates(subset=["src"], keep="first"))
+                    for s_idx, t_idx in best[["src", "tgt"]].itertuples(index=False, name=None):
+                        if int(s_idx) == int(t_idx):
                             continue
                         to_union.setdefault(int(t_idx), []).append(int(s_idx))
                         to_drop.add(int(s_idx))
-                except Exception:
-                    pass  # ainda temos o fallback final
 
-        # ---------- 3) Fallback final: sjoin_nearest (GeoPandas) ----------
-        remain = [int(i) for i in small_idx if int(i) not in to_drop]
-        if remain and len(big_idx) > 0:
-            try:
-                cand = gpd.sjoin_nearest(
-                    gA.loc[remain, ["geometry"]],
-                    gA.loc[big_idx, ["geometry"]],
-                    how="left",
-                    distance_col="__d__",
-                ).reset_index().rename(columns={"index": "_sid"})
-                if not cand.empty and cand["index_right"].notna().any():
-                    # escolhe alvo pelo MAIOR polígono em caso de empates de distância
-                    cand["_sid"] = cand["_sid"].astype("int64")
-                    # usa mapeamento por dicionário sem forçar int onde há NaN
-                    cand["tgt_area"] = cand["index_right"].map(lambda v: big_area.get(int(v), -1.0) if pd.notna(v) else -1.0)
-                    best = (cand.sort_values(["_sid", "__d__", "tgt_area"], ascending=[True, True, False])
-                                .drop_duplicates(subset=["_sid"], keep="first"))
-                    for _, r in best.dropna(subset=["index_right"]).iterrows():
-                        s_idx = int(r["_sid"]); t_idx = int(r["index_right"])
+                # 2) nearest por-geom para os restantes
+                remain = [int(i) for i in small_idx if int(i) not in to_drop]
+                if remain and hasattr(tree, "nearest"):
+                    for s_idx in remain:
+                        j = tree.nearest(gA.at[s_idx, "geometry"])
+                        if j is None:
+                            continue
+                        t_idx = int(big_idx_arr[j])
                         if s_idx == t_idx:
                             continue
                         to_union.setdefault(t_idx, []).append(s_idx)
                         to_drop.add(s_idx)
+
             except Exception:
                 pass
 
-        # ---------- 4) Caso extremo: ninguém é "big" ----------
+        # ---- 4C) Último fallback: sjoin / sjoin_nearest (cuidado com NaN → int) ----
+        if len(big_idx) > 0:
+            remain = [i for i in small_idx if i not in to_drop]
+            if remain:
+                try:
+                    cand = gpd.sjoin(
+                        gA.loc[remain, ["geometry"]],
+                        gA.loc[big_idx, ["geometry"]],
+                        how="left",
+                        predicate="intersects",
+                    ).reset_index().rename(columns={"index": "_sid"})
+                    cand = cand.dropna(subset=["index_right"]).copy()
+                    if not cand.empty:
+                        cand["_sid"] = cand["_sid"].astype(int)
+                        cand["index_right"] = cand["index_right"].astype(int)
+                        cand["tgt_area"] = cand["index_right"].map(big_area)
+                        best = (cand.sort_values(["_sid", "tgt_area"], ascending=[True, False])
+                                    .drop_duplicates(subset=["_sid"], keep="first"))
+                        for _, r in best.iterrows():
+                            s_idx = int(r["_sid"]); t_idx = int(r["index_right"])
+                            if s_idx == t_idx:
+                                continue
+                            to_union.setdefault(t_idx, []).append(s_idx)
+                            to_drop.add(s_idx)
+                except Exception:
+                    pass
+
+            remain = [i for i in small_idx if i not in to_drop]
+            if remain:
+                try:
+                    near = gpd.sjoin_nearest(
+                        gA.loc[remain, ["geometry"]],
+                        gA.loc[big_idx, ["geometry"]],
+                        how="left",
+                        distance_col="__d__",
+                    ).reset_index().rename(columns={"index": "_sid"})
+                    near = near.dropna(subset=["index_right"]).copy()
+                    if not near.empty:
+                        near["_sid"] = near["_sid"].astype(int)
+                        near["index_right"] = near["index_right"].astype(int)
+                        near["tgt_area"] = near["index_right"].map(big_area)
+                        bestn = (near.sort_values(["_sid", "tgt_area"], ascending=[True, False])
+                                    .drop_duplicates(subset=["_sid"], keep="first"))
+                        for _, r in bestn.iterrows():
+                            s_idx = int(r["_sid"]); t_idx = int(r["index_right"])
+                            if s_idx == t_idx:
+                                continue
+                            to_union.setdefault(t_idx, []).append(s_idx)
+                            to_drop.add(s_idx)
+                except Exception:
+                    pass
+
+        # ---- 5) caso extremo: TODO mundo é pequeno ----
         if not to_union and len(big_idx) == 0:
             tgt = int(area_s.idxmax())
             for s_idx in small_idx:
+                s_idx = int(s_idx)
                 if s_idx == tgt:
                     continue
-                to_union.setdefault(tgt, []).append(int(s_idx))
-                to_drop.add(int(s_idx))
+                to_union.setdefault(tgt, []).append(s_idx)
+                to_drop.add(s_idx)
 
-        # ---------- 5) Executar uniões (uma por alvo) ----------
-        for tgt, sm_list in to_union.items():
-            if not sm_list:
-                continue
-            # une todas as pequenas de uma vez e cola no alvo
-            small_union = unary_union(gA.loc[sm_list, "geometry"].tolist())
-            gA.at[int(tgt), "geometry"] = unary_union([gA.at[int(tgt), "geometry"], small_union])
+        # ---- 6) aplicar uniões e finalizar ----
+        return _finish_union_drop(gA)
 
-        if to_drop:
-            gA = gA.drop(index=list(to_drop))
 
-        # ---------- 6) limpeza final / retorno ao CRS de origem ----------
-        if clean_after:
-            try:
-                gA["geometry"] = gA.geometry.buffer(0)
-            except Exception:
-                pass
 
-        g_out = gA.to_crs(orig_crs) if orig_crs else gA
-        return gpd.GeoDataFrame(g_out, geometry="geometry", crs=orig_crs)
+
+
 
     def width_to_scale(
         self,
@@ -688,7 +645,6 @@ class GeoSiglaStyler:
         1 m ≈ 1 / 108000 graus  (pois 1″ ≈ 30 m e 1° = 3600″).
         """
 
-        import math
 
         # ---------- helpers ----------
         def _to_mm(value: float, unit: str) -> float:
