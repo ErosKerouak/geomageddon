@@ -10,3 +10,9 @@ data/sig_*/**
 # Mas mantém as pastas Litologia
 !data/sig_*/Litologia/
 !data/sig_*/Litologia/**
+
+__pycache__
+.ipynb_checkpoints
+
+.env
+.vscode
