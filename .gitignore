@@ -1,0 +1,12 @@
+# Ignora tudo em data/
+data/*
+
+# Exceto as pastas dos estados
+!data/sig_*/
+
+# Dentro de cada estado, ignora tudo
+data/sig_*/**
+
+# Mas mantém as pastas Litologia
+!data/sig_*/Litologia/
+!data/sig_*/Litologia/**

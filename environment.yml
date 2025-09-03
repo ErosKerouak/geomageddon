@@ -1,0 +1,22 @@
+name: geomageddon
+channels:
+  - conda-forge
+dependencies:
+  - python=3.10
+  # Geo stack
+  - geopandas
+  - shapely>=2.0
+  - pyproj
+  - fiona
+  - gdal
+  - scipy
+  - numpy
+  - pandas
+  # Cartografia/plot
+  - matplotlib
+  - cartopy
+  # (cartopy usa pyshp internamente p/ shapereader)
+  - pyshp
+  # Opcional, mas útil
+  - jupyterlab
+  - rtree  # opcional; geopandas pode usar STRtree do Shapely 2, mas isto ajuda em alguns casos
