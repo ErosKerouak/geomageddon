@@ -156,6 +156,11 @@ class GeoSiglaStyler:
         eon_max_field: str ="EON_IDAD_M",
         era_min_field: str ="ERA_MINIMA",
         era_max_field: str ="ERA_MAXIMA",
+        hierarquia_field: str = "HIERARQUIA",
+        roc_field:        str = "CLASSE_ROC",
+        r1_field:         str = "CLASSE_R_1",
+        idade_max_field:  Optional[str] = "IDADE_MAX",
+        idade_min_field:  Optional[str] = "IDADE_MIN",
         # estilos / mapas
         idade_code_map: Optional[Dict]= {
             "Pre-cambriano": {
@@ -233,6 +238,12 @@ class GeoSiglaStyler:
         self.era_min_field = era_min_field
         self.era_max_field = era_max_field
 
+        self.hierarquia_field = hierarquia_field
+        self.roc_field = roc_field
+        self.r1_field = r1_field
+        self.idade_max_field = idade_max_field
+        self.idade_min_field = idade_min_field
+
         self.idade_code_map_rich = idade_code_map or {}
         self.classe_roc_colors = classe_roc_colors or {}
         self.classe_r1_colors  = classe_r1_colors  or {}
@@ -283,39 +294,58 @@ class GeoSiglaStyler:
         if self.min_area_mm2 <= 0:
             raise ValueError("min_area_mm2 deve ser > 0.")
 
-    def combine_and_classify(self,
-                            gdfs: Optional[List[gpd.GeoDataFrame]] = None,
-                            in_gdf: Optional[gpd.GeoDataFrame] = None,
-                            fields_to_keep: Optional[List[str]] = None,
-                            enforce_mode: str = "flag",
-
-                            ) -> gpd.GeoDataFrame:
+    def combine_and_classify(
+        self,
+        gdfs: Optional[List[gpd.GeoDataFrame]] = None,
+        in_gdf: Optional[gpd.GeoDataFrame] = None,
+        fields_to_keep: Optional[List[str]] = None,
+        enforce_mode: str = "flag",
+    ) -> gpd.GeoDataFrame:
         """
         Combina (se gdfs) e classifica (coarse_grp etc.), SEM dissolver.
-        Se cull_small_parts for None, usa self.auto_cull_small_parts.
         """
-        if gdfs and in_gdf is not None:
+
+        # --- obtenção do GeoDataFrame de entrada ---
+        if gdfs is not None and in_gdf is not None:
             raise ValueError("Use 'gdfs' OU 'in_gdf', não ambos.")
-        if gdfs:
+        if gdfs is not None:
+            if not isinstance(gdfs, (list, tuple)) or len(gdfs) == 0:
+                raise ValueError("'gdfs' deve ser lista/tupla não vazia de GeoDataFrames.")
             g = self.merge(gdfs)
         elif in_gdf is not None:
             g = in_gdf.copy()
         else:
             raise ValueError("Forneça 'gdfs' ou 'in_gdf'.")
 
+        # --- montar conjunto de campos a preservar ---
         must = set(fields_to_keep or [])
-        must.update({"SIGLA_UNID","NOME_UNIDA","HIERARQUIA"})  # para legenda
+        must.add(self.sigla_field)
+        must.add(self.name_field)
+
+        # Esses podem não existir na instância; só adiciona se configurados
+        for attr_name in (
+            "hierarquia_field",
+            "idade_max_field", "idade_min_field",
+            "roc_field", "r1_field",
+            "eon_min_field", "eon_max_field",
+            "era_min_field", "era_max_field",
+        ):
+            col = getattr(self, attr_name, None)
+            if col:  # só adiciona se não for None/""
+                must.add(col)
+
+        # --- classificar e limpar colunas duplicadas ---
         g = self.classify(g, enforce_mode=enforce_mode, fields_to_keep=sorted(must))
         g = g.loc[:, ~g.columns.duplicated(keep="last")]
 
-
+        # --- atualizar caches ---
         self.g_base = g
-        # reset caches dependentes
         self.g_clipped = None
         self.color_map = None
         self.color_audit = None
         self.legend_dict = None
         return g
+
 
     def dissolve_by_attr(
         self,
@@ -323,28 +353,140 @@ class GeoSiglaStyler:
         attr: str = "coarse_grp"
     ) -> gpd.GeoDataFrame:
         """
-        Faz dissolve por 'attr' e em seguida explode em partes simples.
-        Retorna uma linha por parte simples (com a coluna 'attr' preservada).
+        Dissolve por 'attr' preservando atributos:
+        - textos (sigla/nome/hierarquia/ROC/R1): concatenação única (ordem de 1ª ocorrência)
+        - EON/ERA mín: mais antigo; EON/ERA máx: mais recente
+        - IDADE_MIN (Ma): mais antigo (máximo); IDADE_MAX (Ma): mais recente (mínimo)
+        Depois explode em partes simples.
         """
         if gdf is None:
             gdf = self.g_clipped if self.g_clipped is not None else self.g_base
         if gdf is None:
             raise ValueError("Sem dados. Use combine_and_classify (e clip_to_bbox se quiser) antes.")
+        if attr not in gdf.columns:
+            raise KeyError(f"Coluna '{attr}' não encontrada. Colunas: {list(gdf.columns)}")
 
-        gdf_diss = self.dissolve_by(gdf, attr=attr)
+        g = gdf.copy()
 
-        # explode após dissolve (uma linha por parte simples)
-        gdf_parts = self.explode_multipart(
-            gdf_diss,
-            repair=False,                 # já aplicamos buffer(0) no dissolve
-            drop_empty=True,
-            id_col=f"{attr}_part",        # identificador estável p/ cada parte
-            keep_src_index=False
+        # -------- helpers --------
+        def _series_str_clean(s: pd.Series) -> pd.Series:
+            if s is None:
+                return pd.Series([], dtype=object)
+            z = s.astype(object).where(pd.notna(s), "").astype(str).str.strip()
+            z = z[z != ""]
+            return z
+
+        def _concat_unique(sub: pd.DataFrame, col: Optional[str]) -> str:
+            if not col or col not in sub.columns:
+                return ""
+            z = _series_str_clean(sub[col])
+            if z.empty:
+                return ""
+            vals = [v for v in pd.unique(z) if v not in ("", "nan", "None")]
+            return " | ".join(vals)
+
+        # ordem geológica (do MAIS ANTIGO → MAIS RECENTE)
+        EON_ORDER  = ["ARQUEANO", "PROTEROZOICO", "FANEROZOICO"]
+        ERA_ORDER  = ["PALEOZOICO", "MESOZOICO", "CENOZOICO"]
+        eon_rank = {k: i for i, k in enumerate(EON_ORDER)}
+        era_rank = {k: i for i, k in enumerate(ERA_ORDER)}
+
+        def _pick_oldest_cat(sub: pd.DataFrame, col: Optional[str], rank_map: Dict[str,int]) -> str:
+            if not col or col not in sub.columns:
+                return ""
+            z = _series_str_clean(sub[col]).apply(self._norm_txt)
+            z = z[z.isin(list(rank_map))]
+            if z.empty:
+                return ""
+            r = z.map(rank_map)              # Series de ranks (menor = mais antigo)
+            idx = r.idxmin()                 # rótulo do índice
+            return z.loc[idx]                # usar .loc, não .iloc
+
+        def _pick_youngest_cat(sub: pd.DataFrame, col: Optional[str], rank_map: Dict[str,int]) -> str:
+            if not col or col not in sub.columns:
+                return ""
+            z = _series_str_clean(sub[col]).apply(self._norm_txt)
+            z = z[z.isin(list(rank_map))]
+            if z.empty:
+                return ""
+            r = z.map(rank_map)              # maior rank = mais recente
+            idx = r.idxmax()
+            return z.loc[idx]
+
+        def _to_num_ma(s: pd.Series) -> pd.Series:
+            if s is None:
+                return pd.Series(dtype="float64")
+            t = s.astype(object).where(pd.notna(s), "").astype(str)
+            t = t.str.replace(",", ".", regex=False)
+            num = pd.to_numeric(t, errors="coerce")
+            return num.dropna()
+
+        def _pick_oldest_ma(sub: pd.DataFrame, col: Optional[str]) -> Optional[float]:
+            if not col or col not in sub.columns:
+                return None
+            v = _to_num_ma(sub[col])
+            return (float(v.max()) if not v.empty else None)   # mais antigo (Ma) = maior
+
+        def _pick_youngest_ma(sub: pd.DataFrame, col: Optional[str]) -> Optional[float]:
+            if not col or col not in sub.columns:
+                return None
+            v = _to_num_ma(sub[col])
+            return (float(v.min()) if not v.empty else None)   # mais recente (Ma) = menor
+
+        # -------- agrega atributos por grupo --------
+        text_cols = {
+            "sigla": self.sigla_field,
+            "nome": self.name_field,
+            "hier": getattr(self, "hierarquia_field", None),
+            "roc":  getattr(self, "roc_field", None),
+            "r1":   getattr(self, "r1_field", None),
+        }
+
+        eon_min_col  = getattr(self, "eon_min_field", None)
+        eon_max_col  = getattr(self, "eon_max_field", None)
+        era_min_col  = getattr(self, "era_min_field", None)
+        era_max_col  = getattr(self, "era_max_field", None)
+        id_min_col   = getattr(self, "idade_min_field", None)
+        id_max_col   = getattr(self, "idade_max_field", None)
+
+        def _agg_row(sub: pd.DataFrame) -> pd.Series:
+            out = {}
+            # concatenações únicas
+            out[text_cols["sigla"]] = _concat_unique(sub, text_cols["sigla"])
+            out[text_cols["nome"]]  = _concat_unique(sub, text_cols["nome"])
+            if text_cols["hier"]: out[text_cols["hier"]] = _concat_unique(sub, text_cols["hier"])
+            if text_cols["roc"]:  out[text_cols["roc"]]  = _concat_unique(sub, text_cols["roc"])
+            if text_cols["r1"]:   out[text_cols["r1"]]   = _concat_unique(sub, text_cols["r1"])
+            # eon/era categóricos
+            if eon_min_col: out[eon_min_col] = _pick_oldest_cat(sub, eon_min_col, eon_rank)
+            if eon_max_col: out[eon_max_col] = _pick_youngest_cat(sub, eon_max_col, eon_rank)
+            if era_min_col: out[era_min_col] = _pick_oldest_cat(sub, era_min_col, era_rank)
+            if era_max_col: out[era_max_col] = _pick_youngest_cat(sub, era_max_col, era_rank)
+            # idades (Ma)
+            if id_min_col: out[id_min_col] = _pick_oldest_ma(sub, id_min_col)
+            if id_max_col: out[id_max_col] = _pick_youngest_ma(sub, id_max_col)
+            return pd.Series(out)
+
+        agg_df = (
+            g.groupby(attr, dropna=False, sort=False)
+            .apply(_agg_row)
+            .reset_index()
         )
 
+        # -------- dissolve geométrico --------
+        gdf_diss = self.dissolve_by(g, attr=attr)  # -> [attr, geometry]
+
+        # -------- junta atributos agregados e explode --------
+        gdf_diss = gdf_diss.merge(agg_df, on=attr, how="left")
+
+        gdf_parts = self.explode_multipart(
+            gdf_diss,
+            repair=False,
+            drop_empty=True,
+            id_col=f"{attr}_part",
+            keep_src_index=False
+        )
         return gdf_parts
-
-
 
 
     def cull_small_parts_by_scale(
@@ -833,12 +975,13 @@ class GeoSiglaStyler:
 
 
     def make_legend_json(self,
-                        gdf: gpd.GeoDataFrame,
-                        out_path: Union[str, Path],
-                        group_attr: str = "coarse_grp",
-                        sigla_col: Optional[str] = None,
-                        nome_col: str = "NOME_UNIDA",
-                        hier_col: str = "HIERARQUIA"):
+        gdf: gpd.GeoDataFrame,
+        out_path: Union[str, Path],
+        group_attr: str = "coarse_grp",
+        sigla_col: Optional[str] = None,
+        nome_col: Optional[str] = None,
+        hier_col: Optional[str] = None
+    ):
         """
         Gera um JSON com, para cada `coarse_grp`, a lista dos itens usados no merge:
         { "<coarse_grp>": { "items": [ {"sigla": "...","nome": "...","hierarquia": "..."} , ... ] }, ... }
@@ -850,8 +993,8 @@ class GeoSiglaStyler:
         # decidir coluna de sigla
         c_sigla = (sigla_col or ("sigla" if "sigla" in gdf.columns else self.sigla_field))
         have_sigla = c_sigla in gdf.columns
-        have_nome  = nome_col in gdf.columns
-        have_hier  = hier_col in gdf.columns
+        have_nome  = nome_col in self.name_field
+        have_hier  = hier_col in self.hierarquia_field
 
         if not have_sigla and not have_nome and not have_hier:
             # nada a fazer
@@ -1642,7 +1785,7 @@ class GeoSiglaStyler:
 
             # ROC ponderado
             roc_pack = self._weighted_items_for_column(
-                gdf, grp, "CLASSE_ROC",
+                gdf, grp, self.roc_field,
                 color_getter=lambda v: roc_colors_norm.get(_norm_key(v), ""),
                 area_s=area_s
             )
@@ -1651,12 +1794,13 @@ class GeoSiglaStyler:
 
             # R1 ponderado
             r1_pack = self._weighted_items_for_column(
-                gdf, grp, "CLASSE_R_1",
+                gdf, grp, self.r1_field,
                 color_getter=lambda v: r1_colors_norm.get(_norm_key(v), ""),
                 area_s=area_s
             )
             cmap[grp]["r1_colors"] = r1_pack["mix"]
             audit["groups"][grp]["r1"] = r1_pack
+
 
 
         # escolha preliminar — prioridade: QML → ROC (classe única) → idade
@@ -1870,11 +2014,11 @@ class GeoSiglaStyler:
             num = ss.str.extract(r"(-?\d+(?:\.\d+)?)", expand=False)
             return pd.to_numeric(num, errors="coerce")
 
-        have_age = ("IDADE_MAX" in gdf.columns) and ("IDADE_MIN" in gdf.columns)
+        have_age = (self.idade_max_field in gdf.columns) and (self.idade_min_field in gdf.columns)
         g = gdf.copy()
         if have_age:
-            g["__ID_MAX__"] = _coerce_age_series(g["IDADE_MAX"])
-            g["__ID_MIN__"] = _coerce_age_series(g["IDADE_MIN"])
+            g["__ID_MAX__"] = _coerce_age_series(g[self.idade_max_field])
+            g["__ID_MIN__"] = _coerce_age_series(g[self.idade_min_field])
             agg = (g.groupby(group_attr)
                     .agg(idade_max=("__ID_MAX__", "max"),
                         idade_min=("__ID_MIN__", "min"))
@@ -1970,30 +2114,24 @@ class GeoSiglaStyler:
         return out
 
 
-
-
-
     def build_legend_dict(self,
-                        gdf: Optional[gpd.GeoDataFrame] = None,
-                        group_attr: str = "coarse_grp",
-                        sigla_col: Optional[str] = "SIGLA_UNID",
-                        nome_col: str = "NOME_UNIDA",
-                        hier_col: str = "HIERARQUIA") -> Dict:
-        """Legenda hierárquica:
-        Pré-cambriano → {Arqueano, Proterozoico}
-        Fanerozoico   → {Paleozoico, Mesozóico, Cenozoico}
-        Ordena grupos e itens por idade (IDADE_MAX/IDADE_MIN), mais antigos primeiro.
-        """
-
-
+        gdf: Optional[gpd.GeoDataFrame] = None,
+        group_attr: str = "coarse_grp",
+        sigla_col: Optional[str] = None,
+        nome_col: Optional[str] = None,
+        hier_col: Optional[str] = None
+    ) -> Dict:
         if gdf is None:
             gdf = self.g_clipped if self.g_clipped is not None else self.g_base
         if gdf is None:
             raise ValueError("Sem dados. Use combine_and_classify (e clip_to_bbox se quiser) antes.")
 
-        # colunas auxiliares
-        c_sigla = sigla_col if (sigla_col and sigla_col in gdf.columns) else \
-                ("sigla" if "sigla" in gdf.columns else self.sigla_field)
+        c_sigla = (sigla_col
+                if (sigla_col and sigla_col in gdf.columns)
+                else ("sigla" if "sigla" in gdf.columns else self.sigla_field))
+        nome_col = nome_col or self.name_field
+        hier_col = hier_col or self.hierarquia_field
+
         have_nome = nome_col in gdf.columns
         have_hier = hier_col in gdf.columns
         cols = [c for c in [c_sigla, nome_col, hier_col] if c in gdf.columns]
@@ -2001,8 +2139,8 @@ class GeoSiglaStyler:
             self.legend_dict = {"note": "colunas de legenda ausentes no GeoDataFrame"}
             return self.legend_dict
 
-        age_max_col = "IDADE_MAX" if "IDADE_MAX" in gdf.columns else None
-        age_min_col = "IDADE_MIN" if "IDADE_MIN" in gdf.columns else None
+        age_max_col = self.idade_max_field if (self.idade_max_field in gdf.columns) else None
+        age_min_col = self.idade_min_field if (self.idade_min_field in gdf.columns) else None
 
         # normalizadores de número (Ma). None/NaN -> None
         def _to_num(s):
